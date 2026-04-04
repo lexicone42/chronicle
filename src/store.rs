@@ -94,6 +94,9 @@ pub struct Store {
     /// Subscription manager for live updates.
     subscriptions: SubscriptionManager,
 
+    /// Write-ahead log for crash recovery.
+    wal: crate::wal::WriteAheadLog,
+
     /// Lock for write operations to ensure atomicity.
     write_lock: Mutex<()>,
 }
@@ -127,6 +130,7 @@ impl Store {
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
+        let wal = crate::wal::WriteAheadLog::open(config.path.join("wal.log"))?;
 
         // Build index from log (empty for new store, but consistent with open())
         let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
@@ -143,6 +147,7 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
+            wal,
             write_lock: Mutex::new(()),
         })
     }
@@ -161,7 +166,17 @@ impl Store {
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
 
-        // Rebuild index from log (O(N) startup, but O(1) sync)
+        // Open WAL and replay any pending entries from a prior crash
+        let wal_path = config.path.join("wal.log");
+        let wal = if wal_path.exists() {
+            let wal = crate::wal::WriteAheadLog::open(&wal_path)?;
+            Self::replay_wal(&wal, &log, &blobs, &branches)?;
+            wal
+        } else {
+            crate::wal::WriteAheadLog::open(&wal_path)?
+        };
+
+        // Rebuild index from log AFTER WAL replay (so replayed records are indexed)
         let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
 
         // Connect state manager to log for disk-based traversal
@@ -176,8 +191,108 @@ impl Store {
             state,
             branches,
             subscriptions: SubscriptionManager::new(),
+            wal,
             write_lock: Mutex::new(()),
         })
+    }
+
+    /// Replay pending WAL entries after a crash.
+    ///
+    /// Uses the log_fence stored in each WAL entry to determine idempotency:
+    /// if the record log has grown past the fence, the write already completed.
+    fn replay_wal(
+        wal: &crate::wal::WriteAheadLog,
+        log: &Arc<RecordLog>,
+        blobs: &BlobStorage,
+        branches: &BranchManager,
+    ) -> Result<()> {
+        use crate::wal::WalOperation;
+
+        let mut pending = wal.get_pending_entries()?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by sequence to replay in order
+        pending.sort_by_key(|e| e.seq);
+
+        let log_size = log.size();
+
+        for entry in &pending {
+            match &entry.operation {
+                WalOperation::AppendRecord {
+                    record_type,
+                    payload,
+                    encoding,
+                    caused_by,
+                    linked_to,
+                    branch_id,
+                    log_fence,
+                } => {
+                    if log_size > *log_fence {
+                        // Write already made it to the log — skip
+                    } else {
+                        // Replay: reconstruct the RecordInput and append
+                        let encoding_enum = match encoding {
+                            0 => crate::types::PayloadEncoding::Json,
+                            1 => crate::types::PayloadEncoding::MessagePack,
+                            _ => crate::types::PayloadEncoding::Raw,
+                        };
+                        let input = RecordInput {
+                            record_type: record_type.clone(),
+                            payload: payload.clone(),
+                            encoding: encoding_enum,
+                            caused_by: caused_by.iter().map(|id| RecordId(*id)).collect(),
+                            linked_to: linked_to.iter().map(|id| RecordId(*id)).collect(),
+                        };
+                        let branch = branches.get_branch_by_id(crate::types::BranchId(*branch_id))
+                            .ok_or_else(|| StoreError::Corruption(
+                                format!("WAL replay: branch {} not found", branch_id)
+                            ))?;
+                        let next_seq = branch.head.next();
+                        log.append(input, branch.id, next_seq)?;
+                        branches.update_head(branch.id, next_seq)?;
+                    }
+                }
+                WalOperation::UpdateState {
+                    state_id,
+                    operation_data,
+                    branch_id,
+                    log_fence,
+                } => {
+                    if log_size > *log_fence {
+                        // Already written — skip
+                    } else {
+                        // Replay the state update as a record
+                        let input = RecordInput::raw("state_update", operation_data.clone());
+                        let branch = branches.get_branch_by_id(crate::types::BranchId(*branch_id))
+                            .ok_or_else(|| StoreError::Corruption(
+                                format!("WAL replay: branch {} not found", branch_id)
+                            ))?;
+                        let next_seq = branch.head.next();
+                        log.append(input, branch.id, next_seq)?;
+                        branches.update_head(branch.id, next_seq)?;
+                    }
+                }
+                WalOperation::StoreBlob { content, content_type } => {
+                    // Blobs are content-addressed — idempotent by nature
+                    let _ = blobs.store(content, content_type);
+                }
+                WalOperation::CreateBranch { name, from } => {
+                    // Branch creation is idempotent if name already exists
+                    let _ = branches.create_branch(name, from.as_deref());
+                }
+                WalOperation::CommitMarker => {
+                    // Not a real operation — skip
+                }
+            }
+
+            wal.commit(entry.seq)?;
+        }
+
+        // All replayed — clear the WAL
+        wal.clear()?;
+        Ok(())
     }
 
     // --- Record Operations ---
@@ -188,6 +303,22 @@ impl Store {
 
         let branch = self.branches.current_branch()?;
         let next_seq = branch.head.next();
+
+        // WAL: write intent before the actual append
+        let encoding_byte = match input.encoding {
+            crate::types::PayloadEncoding::Json => 0u8,
+            crate::types::PayloadEncoding::MessagePack => 1u8,
+            crate::types::PayloadEncoding::Raw => 2u8,
+        };
+        let wal_seq = self.wal.log(crate::wal::WalOperation::AppendRecord {
+            record_type: input.record_type.clone(),
+            payload: input.payload.clone(),
+            encoding: encoding_byte,
+            caused_by: input.caused_by.iter().map(|id| id.0).collect(),
+            linked_to: input.linked_to.iter().map(|id| id.0).collect(),
+            branch_id: branch.id.0,
+            log_fence: self.log.size(),
+        })?;
 
         let (record, offset) = self.log.append(input, branch.id, next_seq)?;
 
@@ -204,6 +335,9 @@ impl Store {
 
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
+
+        // WAL: mark committed now that all writes succeeded
+        self.wal.commit(wal_seq)?;
 
         // Broadcast to subscribers
         self.subscriptions.broadcast_record(&record);
@@ -402,7 +536,15 @@ impl Store {
 
         // Serialize and append
         let payload = serde_json::to_vec(&update)?;
-        let input = RecordInput::raw("state_update", payload);
+        let input = RecordInput::raw("state_update", payload.clone());
+
+        // WAL: write intent before the actual append
+        let wal_seq = self.wal.log(crate::wal::WalOperation::UpdateState {
+            state_id: state_id.to_string(),
+            operation_data: payload,
+            branch_id: branch.id.0,
+            log_fence: self.log.size(),
+        })?;
 
         let (record, offset) = self.log.append(input, branch.id, next_seq)?;
 
@@ -422,6 +564,9 @@ impl Store {
 
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
+
+        // WAL: mark committed
+        self.wal.commit(wal_seq)?;
 
         // Broadcast state delta to subscribers
         self.subscriptions.broadcast_state_delta(state_id, operation, next_seq);
@@ -1444,6 +1589,8 @@ impl Store {
     /// This is O(1) - only syncs the log file and small metadata files.
     /// The record index is not persisted; it's rebuilt from the log on startup.
     pub fn sync(&self) -> Result<()> {
+        // Sync the WAL first (ensures pending entries are durable)
+        self.wal.sync()?;
         // Sync the append-only log (O(1) - just fsync)
         self.log.sync()?;
         // Sync small metadata files (O(states) and O(branches), typically tiny)

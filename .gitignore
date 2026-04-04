@@ -25,3 +25,5 @@ server/test-ui-store/
 # OS
 .DS_Store
 server/dist
+mutants.out/
+mutants.out.old/

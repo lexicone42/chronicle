@@ -48,13 +48,23 @@ pub enum WalOperation {
     AppendRecord {
         record_type: String,
         payload: Vec<u8>,
+        encoding: u8,
+        caused_by: Vec<u64>,
+        linked_to: Vec<u64>,
+        branch_id: u64,
+        /// Record log file size before this write. Used for idempotent replay:
+        /// if log.size() > log_fence, the write already completed.
+        log_fence: u64,
     },
     /// Update a state.
     UpdateState {
         state_id: String,
         operation_data: Vec<u8>, // Serialized StateOperation
+        branch_id: u64,
+        /// Record log file size before this write.
+        log_fence: u64,
     },
-    /// Store a blob.
+    /// Store a blob (idempotent by nature — content-addressed).
     StoreBlob {
         content: Vec<u8>,
         content_type: String,
@@ -64,6 +74,8 @@ pub enum WalOperation {
         name: String,
         from: Option<String>,
     },
+    /// Internal commit marker (not a real operation).
+    CommitMarker,
 }
 
 /// Write-Ahead Log manager.
@@ -136,6 +148,13 @@ impl WriteAheadLog {
     }
 
     /// Log an operation (returns sequence number).
+    ///
+    /// The entry is written and flushed to the OS buffer but NOT fsynced
+    /// on every call. The caller should call `sync()` when durability is
+    /// needed (e.g., the Store's periodic sync). This avoids the ~10-20ms
+    /// fsync penalty on every write while still providing crash recovery:
+    /// entries in the OS buffer survive process crashes (just not power loss).
+    /// For full power-loss durability, call `sync()` after critical operations.
     pub fn log(&self, operation: WalOperation) -> Result<u64> {
         let mut next_seq = self.next_seq.lock();
         let seq = *next_seq;
@@ -155,26 +174,33 @@ impl WriteAheadLog {
         if let Some(ref mut w) = *writer {
             Self::write_entry(w, &entry)?;
             w.flush()?;
-            // fsync for durability
-            w.get_ref().sync_all()?;
         }
 
         Ok(seq)
     }
 
+    /// Force sync all WAL entries to disk (fsync).
+    pub fn sync(&self) -> Result<()> {
+        let writer = self.writer.lock();
+        if let Some(ref w) = *writer {
+            w.get_ref().sync_all()?;
+        }
+        Ok(())
+    }
+
     /// Mark an entry as committed.
+    ///
+    /// The commit marker is buffered but NOT fsynced for performance.
+    /// This is safe because: if we crash before the marker is durable,
+    /// the entry stays "pending" and gets replayed — which is idempotent
+    /// thanks to the log_fence check in replay.
     pub fn commit(&self, seq: u64) -> Result<()> {
-        // For simplicity, we'll write a new commit marker entry
-        // A more sophisticated implementation would update in place
         let mut writer = self.writer.lock();
         if let Some(ref mut w) = *writer {
             let marker = WalEntry {
                 seq,
                 status: WalEntryStatus::Committed,
-                operation: WalOperation::AppendRecord {
-                    record_type: "_commit".to_string(),
-                    payload: vec![],
-                },
+                operation: WalOperation::CommitMarker,
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -182,7 +208,8 @@ impl WriteAheadLog {
             };
             Self::write_entry(w, &marker)?;
             w.flush()?;
-            w.get_ref().sync_all()?;
+            // No fsync here — commit markers are advisory, not critical.
+            // Worst case on crash: a committed op gets replayed (idempotent).
         }
         Ok(())
     }
@@ -293,30 +320,32 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn test_append_op(record_type: &str, payload: &[u8]) -> WalOperation {
+        WalOperation::AppendRecord {
+            record_type: record_type.to_string(),
+            payload: payload.to_vec(),
+            encoding: 2,
+            caused_by: vec![],
+            linked_to: vec![],
+            branch_id: 1,
+            log_fence: 0,
+        }
+    }
+
     #[test]
     fn test_wal_basic() {
         let dir = TempDir::new().unwrap();
         let wal = WriteAheadLog::open(dir.path().join("test.wal")).unwrap();
 
-        // Log an operation
-        let seq = wal
-            .log(WalOperation::AppendRecord {
-                record_type: "test".to_string(),
-                payload: b"hello".to_vec(),
-            })
-            .unwrap();
-
+        let seq = wal.log(test_append_op("test", b"hello")).unwrap();
         assert_eq!(seq, 1);
 
-        // Should have one pending entry
         let pending = wal.get_pending_entries().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, 1);
 
-        // Commit it
         wal.commit(1).unwrap();
 
-        // Should have no pending entries
         let pending = wal.get_pending_entries().unwrap();
         assert!(pending.is_empty());
     }
@@ -326,37 +355,17 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal = WriteAheadLog::open(dir.path().join("test.wal")).unwrap();
 
-        // Log multiple operations
-        let seq1 = wal
-            .log(WalOperation::AppendRecord {
-                record_type: "test1".to_string(),
-                payload: b"one".to_vec(),
-            })
-            .unwrap();
-
-        let seq2 = wal
-            .log(WalOperation::AppendRecord {
-                record_type: "test2".to_string(),
-                payload: b"two".to_vec(),
-            })
-            .unwrap();
-
-        let seq3 = wal
-            .log(WalOperation::AppendRecord {
-                record_type: "test3".to_string(),
-                payload: b"three".to_vec(),
-            })
-            .unwrap();
+        let seq1 = wal.log(test_append_op("test1", b"one")).unwrap();
+        let seq2 = wal.log(test_append_op("test2", b"two")).unwrap();
+        let seq3 = wal.log(test_append_op("test3", b"three")).unwrap();
 
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2);
         assert_eq!(seq3, 3);
 
-        // Commit first and third
         wal.commit(1).unwrap();
         wal.commit(3).unwrap();
 
-        // Only second should be pending
         let pending = wal.get_pending_entries().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, 2);
@@ -367,7 +376,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal_path = dir.path().join("test.wal");
 
-        // Write and close
         {
             let wal = WriteAheadLog::open(&wal_path).unwrap();
             wal.log(WalOperation::StoreBlob {
@@ -375,10 +383,8 @@ mod tests {
                 content_type: "text/plain".to_string(),
             })
             .unwrap();
-            // Drop without committing
         }
 
-        // Reopen and check pending
         {
             let wal = WriteAheadLog::open(&wal_path).unwrap();
             let pending = wal.get_pending_entries().unwrap();
@@ -397,29 +403,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal = WriteAheadLog::open(dir.path().join("test.wal")).unwrap();
 
-        // Log some operations
-        wal.log(WalOperation::AppendRecord {
-            record_type: "test".to_string(),
-            payload: vec![],
-        })
-        .unwrap();
-
+        wal.log(test_append_op("test", b"")).unwrap();
         assert!(wal.has_pending().unwrap());
 
-        // Clear
         wal.clear().unwrap();
-
         assert!(!wal.has_pending().unwrap());
 
-        // Can log again
-        let seq = wal
-            .log(WalOperation::AppendRecord {
-                record_type: "after_clear".to_string(),
-                payload: vec![],
-            })
-            .unwrap();
-
-        // Sequence should reset
+        let seq = wal.log(test_append_op("after_clear", b"")).unwrap();
         assert_eq!(seq, 1);
     }
 }
