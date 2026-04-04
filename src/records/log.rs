@@ -400,8 +400,15 @@ impl RecordLog {
                 break;
             }
 
-            // Skip version and flags
-            file.seek(SeekFrom::Current(2))?;
+            // Verify version
+            let mut version = [0u8; 1];
+            file.read_exact(&mut version)?;
+            if version[0] != LOG_VERSION {
+                break; // Unknown version — stop scanning
+            }
+
+            // Skip flags
+            file.seek(SeekFrom::Current(1))?;
 
             // Read ID
             let mut id_bytes = [0u8; 8];
@@ -422,11 +429,14 @@ impl RecordLog {
             // Skip encoding
             file.seek(SeekFrom::Current(1))?;
 
-            // Read payload length and skip payload
+            // Read payload length and skip payload (with size guard)
             let mut payload_len_bytes = [0u8; 4];
             file.read_exact(&mut payload_len_bytes)?;
-            let payload_len = u32::from_le_bytes(payload_len_bytes) as i64;
-            file.seek(SeekFrom::Current(payload_len))?;
+            let payload_len = u32::from_le_bytes(payload_len_bytes);
+            if payload_len > MAX_PAYLOAD_SIZE {
+                break; // Corrupted record — stop scanning
+            }
+            file.seek(SeekFrom::Current(payload_len as i64))?;
 
             // Read caused_by count and skip
             let mut caused_by_count_bytes = [0u8; 2];
