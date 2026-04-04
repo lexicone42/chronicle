@@ -667,12 +667,19 @@ impl BranchManager {
         let current_id = BranchId(u64::from_le_bytes(current_bytes));
         *self.current.write() = current_id;
 
-        // Read index
+        // Read index (with size guard — 64 MiB max for branch metadata)
         let mut len_bytes = [0u8; 8];
         file.read_exact(&mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
+        let len = u64::from_le_bytes(len_bytes);
 
-        let mut encoded = vec![0u8; len];
+        if len > 64 * 1024 * 1024 {
+            return Err(StoreError::PayloadTooLarge {
+                size: len,
+                limit: 64 * 1024 * 1024,
+            });
+        }
+
+        let mut encoded = vec![0u8; len as usize];
         file.read_exact(&mut encoded)?;
 
         let index: BranchIndex = rmp_serde::from_slice(&encoded)
