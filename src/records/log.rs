@@ -70,7 +70,7 @@ impl RecordLog {
 
         // Determine next ID by scanning if file exists
         let next_id = if file_size > 0 {
-            Self::find_max_id(&file)? + 1
+            Self::find_max_id(&file)?.saturating_add(1)
         } else {
             1
         };
