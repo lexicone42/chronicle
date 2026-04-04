@@ -1,0 +1,45 @@
+[package]
+name = "chronicle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3.8"
+serde_json = "1.0"
+
+[dependencies.chronicle]
+path = ".."
+
+[[bin]]
+name = "fuzz_apply_operation"
+path = "fuzz_targets/fuzz_apply_operation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_record_deser"
+path = "fuzz_targets/fuzz_record_deser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_store_operations"
+path = "fuzz_targets/fuzz_store_operations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tree_paths"
+path = "fuzz_targets/fuzz_tree_paths.rs"
+test = false
+doc = false
+bench = false
