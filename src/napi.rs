@@ -481,7 +481,7 @@ impl JsStore {
     #[napi]
     pub fn current_branch(&self) -> Result<JsBranch> {
         let store = self.get_store()?;
-        let branch = store.current_branch();
+        let branch = store.current_branch().map_err(to_napi_error)?;
         Ok(JsBranch {
             id: branch.id.0.to_string(),
             name: branch.name,
@@ -854,7 +854,7 @@ impl JsStore {
     #[napi]
     pub fn list_states(&self) -> Result<Vec<JsStateInfo>> {
         let store = self.get_store()?;
-        let branch_id = store.current_branch().id;
+        let branch_id = store.current_branch().map_err(to_napi_error)?.id;
         Ok(store
             .state
             .state_ids()
@@ -892,7 +892,7 @@ impl JsStore {
     #[napi]
     pub fn current_sequence(&self) -> Result<i64> {
         let store = self.get_store()?;
-        Ok(store.current_branch().head.0 as i64)
+        Ok(store.current_branch().map_err(to_napi_error)?.head.0 as i64)
     }
 
     /// Get state value at a specific sequence (historical access).

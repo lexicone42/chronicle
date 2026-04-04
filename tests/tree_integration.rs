@@ -154,12 +154,12 @@ fn test_tree_diff() {
     register_tree(&store, "files");
 
     store.tree_set("files", "a.txt", &entry("aaa", 10)).unwrap();
-    let seq1 = store.current_branch().head;
+    let seq1 = store.current_branch().unwrap().head;
 
     store.tree_set("files", "b.txt", &entry("bbb", 20)).unwrap();
     store.tree_set("files", "a.txt", &entry("aaa_v2", 15)).unwrap();
     store.tree_remove("files", "a.txt").unwrap();
-    let seq2 = store.current_branch().head;
+    let seq2 = store.current_branch().unwrap().head;
 
     let changes = store.tree_diff("files", seq1, seq2).unwrap();
     assert_eq!(changes.len(), 2); // a.txt removed, b.txt added
@@ -303,11 +303,11 @@ fn test_tree_diff_modifications() {
 
     store.tree_set("files", "a.txt", &entry("v1", 10)).unwrap();
     store.tree_set("files", "b.txt", &entry("v1", 20)).unwrap();
-    let seq1 = store.current_branch().head;
+    let seq1 = store.current_branch().unwrap().head;
 
     // Modify a, leave b unchanged
     store.tree_set("files", "a.txt", &entry("v2", 15)).unwrap();
-    let seq2 = store.current_branch().head;
+    let seq2 = store.current_branch().unwrap().head;
 
     let changes = store.tree_diff("files", seq1, seq2).unwrap();
     assert_eq!(changes.len(), 1);

@@ -235,14 +235,16 @@ impl BranchManager {
     }
 
     /// Get the current branch.
-    pub fn current_branch(&self) -> Branch {
+    pub fn current_branch(&self) -> Result<Branch> {
         let current_id = *self.current.read();
         self.index
             .read()
             .branches
             .get(&current_id)
             .cloned()
-            .expect("Current branch should always exist")
+            .ok_or_else(|| StoreError::Corruption(
+                format!("Current branch {:?} not found in index", current_id)
+            ))
     }
 
     /// Switch to a different branch.
@@ -739,12 +741,12 @@ mod tests {
 
         manager.create_branch("feature", None).unwrap();
 
-        let current = manager.current_branch();
+        let current = manager.current_branch().unwrap();
         assert_eq!(current.name, MAIN_BRANCH);
 
         manager.switch_branch("feature").unwrap();
 
-        let current = manager.current_branch();
+        let current = manager.current_branch().unwrap();
         assert_eq!(current.name, "feature");
     }
 
@@ -828,7 +830,7 @@ mod tests {
         {
             let manager = BranchManager::load(&path).unwrap();
 
-            let current = manager.current_branch();
+            let current = manager.current_branch().unwrap();
             assert_eq!(current.name, "feature");
 
             let branches = manager.list_branches();

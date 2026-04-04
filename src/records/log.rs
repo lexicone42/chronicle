@@ -11,10 +11,15 @@ use std::path::{Path, PathBuf};
 const LOG_MAGIC: &[u8; 4] = b"REC\0";
 
 /// Current log format version.
-const LOG_VERSION: u8 = 1;
+/// v2: checksum now covers all record fields (not just payload).
+const LOG_VERSION: u8 = 2;
 
 /// Record header size (fixed part).
 const RECORD_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + 8 + 8 + 8; // magic + version + flags + id + seq + branch + timestamp
+
+/// Maximum payload size: 256 MiB. Prevents unbounded allocations when reading
+/// potentially malformed records from disk.
+const MAX_PAYLOAD_SIZE: u32 = 256 * 1024 * 1024;
 
 /// Append-only record log.
 pub struct RecordLog {
@@ -216,9 +221,23 @@ impl RecordLog {
             file.write_all(&id.0.to_le_bytes())?;
         }
 
-        // Checksum of entire record (excluding checksum itself)
-        // For simplicity, we'll compute checksum of payload only
-        let checksum = crc32fast::hash(&record.payload);
+        // Checksum covers all record fields (not just payload) to detect
+        // metadata corruption (sequence, branch, timestamps, causal links).
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&record.id.0.to_le_bytes());
+        hasher.update(&record.sequence.0.to_le_bytes());
+        hasher.update(&record.branch.0.to_le_bytes());
+        hasher.update(&record.timestamp.0.to_le_bytes());
+        hasher.update(record.record_type.as_bytes());
+        hasher.update(&[encoding_byte]);
+        hasher.update(&record.payload);
+        for id in &record.caused_by {
+            hasher.update(&id.0.to_le_bytes());
+        }
+        for id in &record.linked_to {
+            hasher.update(&id.0.to_le_bytes());
+        }
+        let checksum = hasher.finalize();
         file.write_all(&checksum.to_le_bytes())?;
 
         Ok(())
@@ -288,7 +307,14 @@ impl RecordLog {
         // Payload
         let mut payload_len_bytes = [0u8; 4];
         file.read_exact(&mut payload_len_bytes)?;
-        let payload_len = u32::from_le_bytes(payload_len_bytes) as usize;
+        let payload_len_raw = u32::from_le_bytes(payload_len_bytes);
+        if payload_len_raw > MAX_PAYLOAD_SIZE {
+            return Err(StoreError::PayloadTooLarge {
+                size: payload_len_raw as u64,
+                limit: MAX_PAYLOAD_SIZE as u64,
+            });
+        }
+        let payload_len = payload_len_raw as usize;
         let mut payload = vec![0u8; payload_len];
         file.read_exact(&mut payload)?;
 
@@ -314,11 +340,26 @@ impl RecordLog {
             linked_to.push(RecordId(u64::from_le_bytes(id_bytes)));
         }
 
-        // Checksum
+        // Checksum — covers all record fields, not just payload
         let mut checksum_bytes = [0u8; 4];
         file.read_exact(&mut checksum_bytes)?;
         let stored_checksum = u32::from_le_bytes(checksum_bytes);
-        let computed_checksum = crc32fast::hash(&payload);
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&id_bytes);
+        hasher.update(&seq_bytes);
+        hasher.update(&branch_bytes);
+        hasher.update(&ts_bytes);
+        hasher.update(&type_bytes);
+        hasher.update(&encoding_byte);
+        hasher.update(&payload);
+        for cb in &caused_by {
+            hasher.update(&cb.0.to_le_bytes());
+        }
+        for lt in &linked_to {
+            hasher.update(&lt.0.to_le_bytes());
+        }
+        let computed_checksum = hasher.finalize();
 
         if stored_checksum != computed_checksum {
             return Err(StoreError::ChecksumMismatch {

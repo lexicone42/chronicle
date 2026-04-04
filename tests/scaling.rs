@@ -206,7 +206,7 @@ fn test_scaling_50k_multi_branch() {
             format!("branch-{}", b)
         };
         store.switch_branch(&branch_name).unwrap();
-        let branch = store.current_branch();
+        let branch = store.current_branch().unwrap();
         // Each branch should have records_per_branch records (cumulative from main)
         assert!(branch.head.0 >= records_per_branch as u64);
     }
@@ -583,7 +583,7 @@ fn test_scaling_deep_branches() {
 
     // Switch back to main and verify it only has first batch
     store.switch_branch("main").unwrap();
-    let main_branch = store.current_branch();
+    let main_branch = store.current_branch().unwrap();
     assert_eq!(
         main_branch.head.0 as usize,
         records_per_level,
@@ -592,7 +592,7 @@ fn test_scaling_deep_branches() {
 
     // The deepest branch should have all records (since it was created last)
     store.switch_branch(&format!("level-{}", depth - 1)).unwrap();
-    let deepest = store.current_branch();
+    let deepest = store.current_branch().unwrap();
     assert_eq!(
         deepest.head.0 as usize,
         depth * records_per_level,
@@ -899,7 +899,7 @@ fn test_scaling_mixed_workload() {
 
     // Test subscription catch-up (simulating UI reconnection)
     let timer = Timer::new("UI reconnection (subscribe from halfway)");
-    let halfway = store.current_branch().head.0 / 2;
+    let halfway = store.current_branch().unwrap().head.0 / 2;
     let config = SubscriptionConfig {
         filter: SubscriptionFilter::all(),
         from_sequence: Some(Sequence(halfway)),

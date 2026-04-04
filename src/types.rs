@@ -1,7 +1,6 @@
 //! Core types for the record store.
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +33,15 @@ impl fmt::Debug for Sequence {
 
 impl Sequence {
     pub fn next(self) -> Self {
-        Sequence(self.0 + 1)
+        Sequence(self.0.saturating_add(1))
+    }
+
+    /// Checked increment that returns an error on overflow instead of wrapping.
+    pub fn checked_next(self) -> std::result::Result<Self, crate::error::StoreError> {
+        self.0
+            .checked_add(1)
+            .map(Sequence)
+            .ok_or(crate::error::StoreError::SequenceOverflow)
     }
 
     pub fn prev(self) -> Option<Self> {
@@ -56,16 +63,14 @@ impl fmt::Debug for BranchId {
     }
 }
 
-/// Content hash for blobs (SHA-256).
+/// Content hash for blobs (BLAKE3).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hash(pub [u8; 32]);
 
 impl Hash {
     /// Compute hash from bytes.
     pub fn from_bytes(data: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        Hash(hasher.finalize().into())
+        Hash(*blake3::hash(data).as_bytes())
     }
 
     /// Convert to hex string.
@@ -105,12 +110,13 @@ impl fmt::Display for Hash {
 pub struct Timestamp(pub i64);
 
 impl Timestamp {
-    /// Current time.
+    /// Current time. Falls back to the previous timestamp if the system clock
+    /// goes backwards (e.g. NTP adjustment), avoiding a panic.
     pub fn now() -> Self {
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        Timestamp(duration.as_micros() as i64)
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(duration) => Timestamp(duration.as_micros() as i64),
+            Err(_) => Timestamp(0),
+        }
     }
 }
 
@@ -359,7 +365,7 @@ pub struct StateRegistration {
 /// A single entry in a tree state (represents a file).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
-    /// SHA-256 hash of the file content (stored in blob storage).
+    /// BLAKE3 hash of the file content (stored in blob storage).
     pub blob_hash: String,
     /// Size of the content in bytes.
     pub size: u64,

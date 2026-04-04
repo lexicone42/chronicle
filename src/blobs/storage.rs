@@ -15,6 +15,10 @@ const BLOB_MAGIC: &[u8; 4] = b"BLB\0";
 /// Current blob format version.
 const BLOB_VERSION: u8 = 1;
 
+/// Maximum blob content size: 1 GiB. Prevents unbounded allocations
+/// when reading potentially malformed blob files from disk.
+const MAX_BLOB_SIZE: u64 = 1024 * 1024 * 1024;
+
 /// Cached blob data (content + content_type).
 #[derive(Clone)]
 struct CachedBlob {
@@ -141,7 +145,14 @@ impl BlobStorage {
         // Read content
         let mut content_len_bytes = [0u8; 8];
         file.read_exact(&mut content_len_bytes)?;
-        let content_len = u64::from_le_bytes(content_len_bytes) as usize;
+        let content_len_raw = u64::from_le_bytes(content_len_bytes);
+        if content_len_raw > MAX_BLOB_SIZE {
+            return Err(StoreError::PayloadTooLarge {
+                size: content_len_raw,
+                limit: MAX_BLOB_SIZE,
+            });
+        }
+        let content_len = content_len_raw as usize;
 
         let mut content = vec![0u8; content_len];
         file.read_exact(&mut content)?;

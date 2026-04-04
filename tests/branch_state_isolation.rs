@@ -924,7 +924,7 @@ fn test_create_branch_at_head_sequence() {
         .unwrap();
 
     // Get current head
-    let main_branch = store.current_branch();
+    let main_branch = store.current_branch().unwrap();
     let head_seq = main_branch.head;
 
     // Branch at HEAD (equivalent to create_branch in terms of state)

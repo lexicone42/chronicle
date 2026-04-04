@@ -65,6 +65,12 @@ pub enum StoreError {
 
     #[error("Subscription was dropped")]
     SubscriptionDropped,
+
+    #[error("Payload too large: {size} bytes exceeds limit of {limit} bytes")]
+    PayloadTooLarge { size: u64, limit: u64 },
+
+    #[error("Sequence overflow: counter exhausted")]
+    SequenceOverflow,
 }
 
 impl From<serde_json::Error> for StoreError {

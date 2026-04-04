@@ -266,8 +266,8 @@ impl WriteAheadLog {
         reader.read_exact(&mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
-        if len > 100 * 1024 * 1024 {
-            // 100MB sanity check
+        if len > 16 * 1024 * 1024 {
+            // 16MB sanity check — prevents unbounded allocation from malformed WAL
             return Err(StoreError::Corruption("WAL entry too large".into()));
         }
 
