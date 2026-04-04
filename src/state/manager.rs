@@ -179,6 +179,32 @@ impl StateManager {
 
     /// Register a new state with its strategy.
     pub fn register_state(&self, registration: StateRegistration) -> Result<()> {
+        // Validate state ID is non-empty
+        if registration.id.is_empty() {
+            return Err(StoreError::InvalidOperation(
+                "State ID cannot be empty".to_string(),
+            ));
+        }
+
+        // Validate snapshot frequencies are non-zero
+        match &registration.strategy {
+            crate::types::StateStrategy::AppendLog {
+                delta_snapshot_every,
+                full_snapshot_every,
+            }
+            | crate::types::StateStrategy::Tree {
+                delta_snapshot_every,
+                full_snapshot_every,
+            } => {
+                if *delta_snapshot_every == 0 || *full_snapshot_every == 0 {
+                    return Err(StoreError::InvalidOperation(
+                        "Snapshot frequencies must be > 0".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+
         let mut index = self.index.write();
 
         if index.strategies.contains_key(&registration.id) {

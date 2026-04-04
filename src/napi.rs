@@ -533,7 +533,10 @@ impl JsStore {
                 delta_snapshot_every: registration.delta_snapshot_every.unwrap_or(50) as u64,
                 full_snapshot_every: registration.full_snapshot_every.unwrap_or(10) as u64,
             },
-            _ => return Err(napi::Error::from_reason("Invalid strategy")),
+            other => return Err(napi::Error::from_reason(format!(
+                "Invalid strategy '{}'. Valid options: snapshot, append_log, tree",
+                other
+            ))),
         };
 
         let reg = StateRegistration {

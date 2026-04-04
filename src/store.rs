@@ -343,43 +343,46 @@ impl Store {
 
         let branch = self.branches.current_branch()?;
 
-        // Validate operation WITHOUT loading full state (critical for 50M+ operations)
-        // - Append: Always succeeds, no validation needed
-        // - Edit: Just check index < len
-        // - Redact: Check start <= end <= len
-        // - Set/Snapshot/DeltaSnapshot: No validation needed
+        // Verify state is registered before attempting operations
+        let strategy = self.state.get_strategy(state_id).ok_or_else(|| {
+            StoreError::StateNotRegistered(state_id.to_string())
+        })?;
+
+        // Validate operation against the registered strategy.
         match &operation {
-            StateOperation::Edit { index, .. } => {
-                let len = self.get_state_len(state_id)?.unwrap_or(0);
-                if *index >= len {
+            StateOperation::Append { .. }
+            | StateOperation::Edit { .. }
+            | StateOperation::Redact { .. } => {
+                if !matches!(strategy, crate::types::StateStrategy::AppendLog { .. }) {
                     return Err(StoreError::InvalidOperation(format!(
-                        "Edit index {} out of bounds (len={})",
-                        index, len
+                        "Append/Edit/Redact operations require AppendLog strategy, state '{}' uses {:?}",
+                        state_id, strategy
                     )));
                 }
-            }
-            StateOperation::Redact { start, end } => {
-                // Note: Out-of-bounds or start > end redacts are allowed and will be
-                // no-ops or clamped during apply_operation. This is intentional for
-                // flexibility - the actual validation happens at reconstruction time.
-                let _ = (start, end); // Suppress unused warnings
             }
             StateOperation::TreeSet { .. }
             | StateOperation::TreeRemove { .. }
             | StateOperation::TreeBatch { .. } => {
-                if !matches!(
-                    self.state.get_strategy(state_id),
-                    Some(crate::types::StateStrategy::Tree { .. })
-                ) {
+                if !matches!(strategy, crate::types::StateStrategy::Tree { .. }) {
                     return Err(StoreError::InvalidOperation(format!(
                         "Tree operations require Tree strategy, state '{}' uses {:?}",
-                        state_id,
-                        self.state.get_strategy(state_id)
+                        state_id, strategy
                     )));
                 }
             }
-            // Append, Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot - no validation needed
+            // Set, Snapshot, DeltaSnapshot, TreeDeltaSnapshot, Field - work on any strategy
             _ => {}
+        }
+
+        // Bounds-check Edit index (after strategy validation)
+        if let StateOperation::Edit { index, .. } = &operation {
+            let len = self.get_state_len(state_id)?.unwrap_or(0);
+            if *index >= len {
+                return Err(StoreError::InvalidOperation(format!(
+                    "Edit index {} out of bounds (len={})",
+                    index, len
+                )));
+            }
         }
 
         // Get current head offset for this state (for chaining)

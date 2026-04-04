@@ -139,6 +139,13 @@ impl BranchManager {
 
     /// Create a new branch from the current head of another branch.
     pub fn create_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
+        // Validate branch name is non-empty and doesn't contain control characters
+        if name.is_empty() {
+            return Err(StoreError::InvalidOperation(
+                "Branch name cannot be empty".to_string(),
+            ));
+        }
+
         let mut index = self.index.write();
 
         // Check if name already exists

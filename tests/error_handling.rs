@@ -197,13 +197,10 @@ fn test_append_to_non_array_state() {
         .update_state("obj", StateOperation::Set(b"{\"key\": \"value\"}".to_vec()))
         .unwrap();
 
-    // Appending to non-array succeeds at write time (lazy validation for performance)
-    // but fails on reconstruction/read
-    store.update_state("obj", StateOperation::Append(b"1".to_vec())).unwrap();
-
-    // Reading the state should fail during reconstruction
-    let result = store.get_state("obj");
-    assert!(matches!(result, Err(StoreError::Deserialization(_))));
+    // Appending to a Snapshot strategy state is now rejected at write time
+    // (strategy validation catches the mismatch before it reaches the log)
+    let result = store.update_state("obj", StateOperation::Append(b"1".to_vec()));
+    assert!(matches!(result, Err(StoreError::InvalidOperation(_))));
 }
 
 #[test]
