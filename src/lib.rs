@@ -35,6 +35,7 @@
 pub mod blobs;
 pub mod branches;
 pub mod error;
+pub mod format;
 #[cfg(feature = "napi-bindings")]
 pub mod napi;
 pub mod records;

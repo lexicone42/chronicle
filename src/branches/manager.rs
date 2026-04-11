@@ -1,6 +1,14 @@
 //! Branch manager implementation.
+//!
+//! The wire format for `branches.bin` is defined in
+//! `crate::format::branch_index`. This file implements the reader/writer
+//! against those constants.
 
 use crate::error::{Result, StoreError};
+use crate::format::branch_index::{
+    MAGIC as BRANCH_INDEX_MAGIC, MAX_SIZE as BRANCH_INDEX_MAX_SIZE,
+    MIN_READABLE_VERSION as BRANCH_INDEX_MIN_VERSION, VERSION as BRANCH_INDEX_VERSION,
+};
 use crate::types::{Branch, BranchId, Sequence, Timestamp};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -8,12 +16,6 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-
-/// Magic bytes for branch index file.
-const BRANCH_INDEX_MAGIC: &[u8; 4] = b"BRI\0";
-
-/// Current branch index format version.
-const BRANCH_INDEX_VERSION: u8 = 1;
 
 /// Name of the main branch.
 pub const MAIN_BRANCH: &str = "main";
@@ -609,6 +611,10 @@ impl BranchManager {
     }
 
     /// Save branch index to file.
+    ///
+    /// Always writes the current format version (v2), which includes a
+    /// trailing CRC32 over the MessagePack-encoded index. See
+    /// `crate::format::branch_index` for the wire format.
     pub fn save(&self) -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -616,10 +622,7 @@ impl BranchManager {
             .truncate(true)
             .open(&self.path)?;
 
-        // Write magic
         file.write_all(BRANCH_INDEX_MAGIC)?;
-
-        // Write version
         file.write_all(&[BRANCH_INDEX_VERSION])?;
 
         // Write current branch
@@ -634,11 +637,19 @@ impl BranchManager {
         file.write_all(&(encoded.len() as u64).to_le_bytes())?;
         file.write_all(&encoded)?;
 
+        // v2: trailing CRC32 over the encoded index
+        let checksum = crc32fast::hash(&encoded);
+        file.write_all(&checksum.to_le_bytes())?;
+
         file.sync_all()?;
         Ok(())
     }
 
     /// Load branch index from file.
+    ///
+    /// Accepts versions `MIN_READABLE_VERSION..=VERSION`. v1 files are
+    /// read without CRC32 validation; v2 files require a matching CRC32
+    /// trailer.
     fn load_from_file(&self) -> Result<()> {
         let mut file = File::open(&self.path)?;
 
@@ -651,13 +662,14 @@ impl BranchManager {
             ));
         }
 
-        // Read version
-        let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
-        if version[0] != BRANCH_INDEX_VERSION {
+        // Read version — accept any version in the supported range
+        let mut version_byte = [0u8; 1];
+        file.read_exact(&mut version_byte)?;
+        let version = version_byte[0];
+        if version < BRANCH_INDEX_MIN_VERSION || version > BRANCH_INDEX_VERSION {
             return Err(StoreError::InvalidFormat(format!(
-                "Unsupported branch index version: {}",
-                version[0]
+                "Unsupported branch index version: {} (supported: {}..={})",
+                version, BRANCH_INDEX_MIN_VERSION, BRANCH_INDEX_VERSION
             )));
         }
 
@@ -667,20 +679,34 @@ impl BranchManager {
         let current_id = BranchId(u64::from_le_bytes(current_bytes));
         *self.current.write() = current_id;
 
-        // Read index (with size guard — 64 MiB max for branch metadata)
+        // Read index (with size guard)
         let mut len_bytes = [0u8; 8];
         file.read_exact(&mut len_bytes)?;
         let len = u64::from_le_bytes(len_bytes);
 
-        if len > 64 * 1024 * 1024 {
+        if len > BRANCH_INDEX_MAX_SIZE {
             return Err(StoreError::PayloadTooLarge {
                 size: len,
-                limit: 64 * 1024 * 1024,
+                limit: BRANCH_INDEX_MAX_SIZE,
             });
         }
 
         let mut encoded = vec![0u8; len as usize];
         file.read_exact(&mut encoded)?;
+
+        // v2+: verify trailing CRC32
+        if version >= 2 {
+            let mut checksum_bytes = [0u8; 4];
+            file.read_exact(&mut checksum_bytes)?;
+            let stored = u32::from_le_bytes(checksum_bytes);
+            let computed = crc32fast::hash(&encoded);
+            if stored != computed {
+                return Err(StoreError::ChecksumMismatch {
+                    expected: stored,
+                    got: computed,
+                });
+            }
+        }
 
         let index: BranchIndex = rmp_serde::from_slice(&encoded)
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;

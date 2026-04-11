@@ -18,11 +18,10 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Magic bytes for state index file.
-const STATE_INDEX_MAGIC: &[u8; 4] = b"STI\0";
-
-/// Current state index format version.
-const STATE_INDEX_VERSION: u8 = 2; // Bumped for new format
+use crate::format::state_index::{
+    MAGIC as STATE_INDEX_MAGIC, MAX_SIZE as STATE_INDEX_MAX_SIZE,
+    MIN_READABLE_VERSION as STATE_INDEX_MIN_VERSION, VERSION as STATE_INDEX_VERSION,
+};
 
 /// Default cache size (number of states).
 const DEFAULT_CACHE_SIZE: usize = 1000;
@@ -701,6 +700,10 @@ impl StateManager {
     }
 
     /// Save state index to file.
+    ///
+    /// Always writes the current format version (v3), which includes a
+    /// trailing CRC32 over the MessagePack-encoded index. See
+    /// `crate::format::state_index` for the wire format.
     pub fn save(&self) -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
@@ -708,10 +711,7 @@ impl StateManager {
             .truncate(true)
             .open(&self.path)?;
 
-        // Write magic
         file.write_all(STATE_INDEX_MAGIC)?;
-
-        // Write version
         file.write_all(&[STATE_INDEX_VERSION])?;
 
         // Serialize index with MessagePack
@@ -719,15 +719,22 @@ impl StateManager {
         let encoded =
             rmp_serde::to_vec(&*index).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-        // Write length and data
         file.write_all(&(encoded.len() as u64).to_le_bytes())?;
         file.write_all(&encoded)?;
+
+        // v3: trailing CRC32 over the encoded index
+        let checksum = crc32fast::hash(&encoded);
+        file.write_all(&checksum.to_le_bytes())?;
 
         file.sync_all()?;
         Ok(())
     }
 
     /// Load state index from file.
+    ///
+    /// Accepts versions `MIN_READABLE_VERSION..=VERSION`. Version 2 files
+    /// are read without CRC32 validation; version 3 files require a
+    /// matching CRC32 trailer.
     fn load_from_file(&self) -> Result<()> {
         let mut file = File::open(&self.path)?;
 
@@ -740,30 +747,45 @@ impl StateManager {
             ));
         }
 
-        // Read version
-        let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
-        if version[0] != STATE_INDEX_VERSION {
+        // Read version — accept any version in the supported range
+        let mut version_byte = [0u8; 1];
+        file.read_exact(&mut version_byte)?;
+        let version = version_byte[0];
+        if version < STATE_INDEX_MIN_VERSION || version > STATE_INDEX_VERSION {
             return Err(StoreError::InvalidFormat(format!(
-                "Unsupported state index version: {}",
-                version[0]
+                "Unsupported state index version: {} (supported: {}..={})",
+                version, STATE_INDEX_MIN_VERSION, STATE_INDEX_VERSION
             )));
         }
 
-        // Read index (with size guard — 64 MiB max for state metadata)
+        // Read index (with size guard)
         let mut len_bytes = [0u8; 8];
         file.read_exact(&mut len_bytes)?;
         let len = u64::from_le_bytes(len_bytes);
 
-        if len > 64 * 1024 * 1024 {
+        if len > STATE_INDEX_MAX_SIZE {
             return Err(StoreError::PayloadTooLarge {
                 size: len,
-                limit: 64 * 1024 * 1024,
+                limit: STATE_INDEX_MAX_SIZE,
             });
         }
 
         let mut encoded = vec![0u8; len as usize];
         file.read_exact(&mut encoded)?;
+
+        // v3+: verify trailing CRC32 over the encoded index
+        if version >= 3 {
+            let mut checksum_bytes = [0u8; 4];
+            file.read_exact(&mut checksum_bytes)?;
+            let stored = u32::from_le_bytes(checksum_bytes);
+            let computed = crc32fast::hash(&encoded);
+            if stored != computed {
+                return Err(StoreError::ChecksumMismatch {
+                    expected: stored,
+                    got: computed,
+                });
+            }
+        }
 
         let index: StateIndex = rmp_serde::from_slice(&encoded)
             .map_err(|e| StoreError::Deserialization(e.to_string()))?;

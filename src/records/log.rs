@@ -1,25 +1,25 @@
 //! Append-only record log.
+//!
+//! The wire format is defined in `crate::format::record_log`. This file
+//! implements the reader/writer against those constants.
 
 use crate::error::{Result, StoreError};
+use crate::format::record_log::{MAGIC as LOG_MAGIC, MAX_PAYLOAD_SIZE, VERSION as LOG_VERSION};
 use crate::types::{BranchId, PayloadEncoding, Record, RecordId, RecordInput, Sequence, Timestamp};
 use parking_lot::RwLock;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// Magic bytes for record log.
-const LOG_MAGIC: &[u8; 4] = b"REC\0";
-
-/// Current log format version.
-/// v2: checksum now covers all record fields (not just payload).
-const LOG_VERSION: u8 = 2;
-
-/// Record header size (fixed part).
-const RECORD_HEADER_SIZE: usize = 4 + 1 + 1 + 8 + 8 + 8 + 8; // magic + version + flags + id + seq + branch + timestamp
-
-/// Maximum payload size: 256 MiB. Prevents unbounded allocations when reading
-/// potentially malformed records from disk.
-const MAX_PAYLOAD_SIZE: u32 = 256 * 1024 * 1024;
+/// Persistent anchor cached in `records.meta` that lets `RecordLog::open`
+/// avoid a full O(N) scan when the previous shutdown was clean.
+#[derive(Clone, Copy, Debug)]
+struct RecordMeta {
+    /// Highest record ID that was written to the log.
+    max_id: u64,
+    /// Record log file size at the time the meta was written.
+    log_size: u64,
+}
 
 /// Append-only record log.
 pub struct RecordLog {
@@ -43,12 +43,9 @@ pub struct RecordLog {
 }
 
 impl RecordLog {
-    /// Default sync interval - sync every 100 writes for balance of durability and performance.
-    const DEFAULT_SYNC_INTERVAL: u64 = 100;
-
     /// Open or create a record log with default sync interval.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_sync_interval(path, Self::DEFAULT_SYNC_INTERVAL)
+        Self::open_with_sync_interval(path, crate::format::record_log::DEFAULT_SYNC_INTERVAL)
     }
 
     /// Open or create a record log with custom sync interval.
@@ -68,11 +65,24 @@ impl RecordLog {
         let metadata = file.metadata()?;
         let file_size = metadata.len();
 
-        // Determine next ID by scanning if file exists
-        let next_id = if file_size > 0 {
-            Self::find_max_id(&file)?.saturating_add(1)
-        } else {
+        // Try to read records.meta anchor first. If it's present and the
+        // recorded file size matches the actual log size, we can skip the
+        // O(N) find_max_id scan.
+        let meta_path = Self::meta_path(&path);
+        let next_id = if file_size == 0 {
             1
+        } else {
+            match Self::read_meta(&meta_path) {
+                Ok(Some(meta)) if meta.log_size == file_size => {
+                    // Clean shutdown: trust the cached max_id
+                    meta.max_id.saturating_add(1)
+                }
+                _ => {
+                    // No meta, or stale meta, or corrupt meta —
+                    // fall back to full scan
+                    Self::find_max_id(&file)?.saturating_add(1)
+                }
+            }
         };
 
         Ok(Self {
@@ -83,6 +93,84 @@ impl RecordLog {
             writes_since_sync: RwLock::new(0),
             sync_interval: if sync_interval == 0 { 1 } else { sync_interval },
         })
+    }
+
+    /// Path to the records.meta file next to the record log.
+    fn meta_path(log_path: &Path) -> PathBuf {
+        let mut meta = log_path.to_path_buf();
+        meta.set_extension("meta");
+        meta
+    }
+
+    /// Read and validate the records.meta anchor file.
+    ///
+    /// Returns `Ok(Some(meta))` if the file exists and is valid, `Ok(None)`
+    /// if it doesn't exist, and `Err` if it exists but is corrupted.
+    fn read_meta(meta_path: &Path) -> Result<Option<RecordMeta>> {
+        use crate::format::records_meta::{MAGIC, VERSION};
+
+        if !meta_path.exists() {
+            return Ok(None);
+        }
+
+        let mut file = File::open(meta_path)?;
+        let mut buf = [0u8; 4 + 1 + 8 + 8 + 4]; // magic + version + max_id + log_size + crc32
+        if file.read_exact(&mut buf).is_err() {
+            // Truncated file — treat as missing, fall back to scan
+            return Ok(None);
+        }
+
+        if &buf[0..4] != MAGIC {
+            return Ok(None); // Not ours, ignore
+        }
+        if buf[4] != VERSION {
+            return Ok(None); // Future version we don't understand
+        }
+
+        let max_id = u64::from_le_bytes(buf[5..13].try_into().unwrap());
+        let log_size = u64::from_le_bytes(buf[13..21].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(buf[21..25].try_into().unwrap());
+
+        // CRC32 over magic + version + max_id + log_size
+        let computed_crc = crc32fast::hash(&buf[0..21]);
+        if stored_crc != computed_crc {
+            // Corrupt meta — fall back to scan
+            return Ok(None);
+        }
+
+        Ok(Some(RecordMeta { max_id, log_size }))
+    }
+
+    /// Write the records.meta anchor file. Called during `sync()` so that
+    /// a clean shutdown leaves a valid anchor that the next open can use.
+    fn write_meta(&self) -> Result<()> {
+        use crate::format::records_meta::{MAGIC, VERSION};
+
+        let meta_path = Self::meta_path(&self.path);
+        let max_id = self.next_id.read().saturating_sub(1);
+        let log_size = *self.file_size.read();
+
+        let mut buf = Vec::with_capacity(25);
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION);
+        buf.extend_from_slice(&max_id.to_le_bytes());
+        buf.extend_from_slice(&log_size.to_le_bytes());
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        // Write atomically via tmp + rename to avoid partial writes
+        let tmp_path = meta_path.with_extension("meta.tmp");
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            file.write_all(&buf)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &meta_path)?;
+        Ok(())
     }
 
     /// Append a record to the log.
@@ -137,9 +225,13 @@ impl RecordLog {
 
     /// Force sync all pending writes to disk.
     pub fn sync(&self) -> Result<()> {
-        let mut file = self.file.write();
-        file.sync_all()?;
-        *self.writes_since_sync.write() = 0;
+        {
+            let file = self.file.write();
+            file.sync_all()?;
+            *self.writes_since_sync.write() = 0;
+        }
+        // Persist the next_id anchor so the next open can skip find_max_id
+        self.write_meta()?;
         Ok(())
     }
 
@@ -559,5 +651,117 @@ mod tests {
             let (record, _offset) = log.append(input, BranchId(1), Sequence(6)).unwrap();
             assert_eq!(record.id.0, 6); // Should continue from max ID
         }
+    }
+
+    #[test]
+    fn test_records_meta_written_on_sync() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        let meta_path = dir.path().join("log.meta");
+
+        {
+            let log = RecordLog::open(&path).unwrap();
+            for i in 1..=3 {
+                log.append(
+                    RecordInput::raw("test", format!("r{}", i).into_bytes()),
+                    BranchId(1),
+                    Sequence(i),
+                )
+                .unwrap();
+            }
+            log.sync().unwrap();
+        }
+
+        // After sync, the meta file should exist
+        assert!(meta_path.exists(), "records.meta should exist after sync");
+
+        // Re-opening should use the cached next_id without scanning
+        // (we verify by checking that the next append gets ID 4)
+        let log = RecordLog::open(&path).unwrap();
+        let (record, _) = log
+            .append(RecordInput::raw("test", b"r4".to_vec()), BranchId(1), Sequence(4))
+            .unwrap();
+        assert_eq!(record.id.0, 4);
+    }
+
+    #[test]
+    fn test_records_meta_stale_falls_back_to_scan() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        let meta_path = dir.path().join("log.meta");
+
+        // Write records and sync, so meta is created
+        {
+            let log = RecordLog::open(&path).unwrap();
+            for i in 1..=3 {
+                log.append(
+                    RecordInput::raw("test", format!("r{}", i).into_bytes()),
+                    BranchId(1),
+                    Sequence(i),
+                )
+                .unwrap();
+            }
+            log.sync().unwrap();
+        }
+
+        // Write one more record WITHOUT syncing — this makes the
+        // meta's log_size stale
+        {
+            let log = RecordLog::open(&path).unwrap();
+            log.append(
+                RecordInput::raw("test", b"r4".to_vec()),
+                BranchId(1),
+                Sequence(4),
+            )
+            .unwrap();
+            // Intentionally no sync — meta is now stale
+            std::mem::forget(log); // keep file open; drop-triggered sync happens nowhere
+        }
+
+        // Wait — the meta file still exists and doesn't match
+        assert!(meta_path.exists());
+
+        // Reopening should detect the mismatch and fall back to scan,
+        // correctly finding that max_id is now 4
+        let log = RecordLog::open(&path).unwrap();
+        let (record, _) = log
+            .append(RecordInput::raw("test", b"r5".to_vec()), BranchId(1), Sequence(5))
+            .unwrap();
+        assert_eq!(record.id.0, 5); // Would be 4 if we'd trusted stale meta
+    }
+
+    #[test]
+    fn test_records_meta_corrupt_falls_back_to_scan() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("log.bin");
+        let meta_path = dir.path().join("log.meta");
+
+        // Write records and sync
+        {
+            let log = RecordLog::open(&path).unwrap();
+            for i in 1..=3 {
+                log.append(
+                    RecordInput::raw("test", format!("r{}", i).into_bytes()),
+                    BranchId(1),
+                    Sequence(i),
+                )
+                .unwrap();
+            }
+            log.sync().unwrap();
+        }
+
+        // Corrupt the meta file by overwriting its CRC bytes
+        let mut meta_content = std::fs::read(&meta_path).unwrap();
+        let len = meta_content.len();
+        meta_content[len - 4] ^= 0xFF;
+        meta_content[len - 1] ^= 0xFF;
+        std::fs::write(&meta_path, &meta_content).unwrap();
+
+        // Should still open correctly (fall back to scan)
+        let log = RecordLog::open(&path).unwrap();
+        let (record, _) = log
+            .append(RecordInput::raw("test", b"r4".to_vec()), BranchId(1), Sequence(4))
+            .unwrap();
+        assert_eq!(record.id.0, 4);
     }
 }
