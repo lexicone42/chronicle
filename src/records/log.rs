@@ -150,6 +150,18 @@ impl RecordLog {
         self.read_record(&mut *file)
     }
 
+    /// Read a record at a given offset, returning both the record and the
+    /// file position immediately after it (i.e. the offset of the next record).
+    ///
+    /// This lets iterators avoid a second read to locate the next record.
+    pub fn read_at_with_end(&self, offset: u64) -> Result<(Record, u64)> {
+        let mut file = self.file.write();
+        file.seek(SeekFrom::Start(offset))?;
+        let record = self.read_record(&mut *file)?;
+        let end = file.stream_position()?;
+        Ok((record, end))
+    }
+
     /// Iterate all records from the beginning.
     pub fn iter(&self) -> RecordIterator {
         self.iter_from(0)
@@ -474,22 +486,9 @@ impl<'a> Iterator for RecordIterator<'a> {
         }
 
         let current_offset = self.offset;
-        match self.log.read_at(current_offset) {
-            Ok(record) => {
-                // Calculate next offset by re-reading position
-                // This is a bit inefficient; we could track size during read
-                let mut file = self.log.file.write();
-                if let Ok(_) = file.seek(SeekFrom::Start(current_offset)) {
-                    // Skip to end of record
-                    if let Ok(rec) = self.log.read_record(&mut *file) {
-                        drop(rec);
-                        self.offset = file.stream_position().unwrap_or(self.end);
-                    } else {
-                        self.offset = self.end;
-                    }
-                } else {
-                    self.offset = self.end;
-                }
+        match self.log.read_at_with_end(current_offset) {
+            Ok((record, next_offset)) => {
+                self.offset = next_offset;
                 Some(Ok((current_offset, record)))
             }
             Err(e) => {

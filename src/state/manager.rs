@@ -105,9 +105,15 @@ pub struct StateIndex {
 }
 
 /// Cached state value.
+///
+/// The value is stored as `Arc<Vec<u8>>` so that cache hits can return a
+/// cheap Arc clone (O(1) pointer copy) instead of copying the entire state
+/// buffer on every read. Callers that can accept an Arc should use
+/// `get_state_arc`; the legacy `get_state` still clones the inner Vec to
+/// preserve API compatibility.
 #[derive(Clone)]
 struct CachedState {
-    value: Vec<u8>,
+    value: Arc<Vec<u8>>,
     head_offset: u64, // To detect staleness
 }
 
@@ -313,7 +319,65 @@ impl StateManager {
     ///
     /// Uses LRU cache for fast repeated access. On cache miss,
     /// reconstructs state by traversing the chain from disk.
+    ///
+    /// Returns an owned `Vec<u8>`. For zero-copy cache hits, use
+    /// `get_state_arc` which returns `Arc<Vec<u8>>`.
     pub fn get_state(&self, branch_id: BranchId, state_id: &str) -> Result<Option<Vec<u8>>> {
+        let index = self.index.read();
+
+        let key = (branch_id, state_id.to_string());
+        let head = match index.heads.get(&key) {
+            Some(h) => h.clone(),
+            None => return Ok(None),
+        };
+        drop(index);
+
+        let cache_key = format!("{}:{}", branch_id.0, state_id);
+
+        // Check cache — clone the inner Vec out of the Arc without going
+        // through get_state_arc (avoids an extra Arc clone + pattern match)
+        {
+            let mut cache = self.cache.write();
+            if let Some(cached) = cache.get(&cache_key) {
+                if cached.head_offset == head.head_offset {
+                    return Ok(Some((*cached.value).clone()));
+                }
+            }
+        }
+
+        // Cache miss - reconstruct from disk
+        let log = self
+            .log
+            .as_ref()
+            .ok_or_else(|| StoreError::NotInitialized)?;
+
+        let value = self.reconstruct_from_disk(log, head.head_offset)?;
+        let arc_value = Arc::new(value.clone());
+
+        {
+            let mut cache = self.cache.write();
+            cache.put(
+                cache_key,
+                CachedState {
+                    value: arc_value,
+                    head_offset: head.head_offset,
+                },
+            );
+        }
+
+        Ok(Some(value))
+    }
+
+    /// Get a state's value as a shared `Arc<Vec<u8>>`.
+    ///
+    /// Cache hits are O(1) — just an atomic refcount increment — regardless
+    /// of state size. This is the preferred entry point for performance-
+    /// sensitive read paths that don't need to mutate the result.
+    pub fn get_state_arc(
+        &self,
+        branch_id: BranchId,
+        state_id: &str,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
         let index = self.index.read();
 
         let key = (branch_id, state_id.to_string());
@@ -330,7 +394,7 @@ impl StateManager {
             let mut cache = self.cache.write();
             if let Some(cached) = cache.get(&cache_key) {
                 if cached.head_offset == head.head_offset {
-                    return Ok(Some(cached.value.clone()));
+                    return Ok(Some(Arc::clone(&cached.value)));
                 }
                 // Stale cache entry, will reconstruct
             }
@@ -342,7 +406,7 @@ impl StateManager {
             .as_ref()
             .ok_or_else(|| StoreError::NotInitialized)?;
 
-        let value = self.reconstruct_from_disk(log, head.head_offset)?;
+        let value = Arc::new(self.reconstruct_from_disk(log, head.head_offset)?);
 
         // Cache the result
         {
@@ -350,7 +414,7 @@ impl StateManager {
             cache.put(
                 cache_key,
                 CachedState {
-                    value: value.clone(),
+                    value: Arc::clone(&value),
                     head_offset: head.head_offset,
                 },
             );

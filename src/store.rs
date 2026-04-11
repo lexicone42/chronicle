@@ -589,6 +589,16 @@ impl Store {
         self.state.get_state(branch_id, state_id)
     }
 
+    /// Get the current value of a state as a shared `Arc<Vec<u8>>`.
+    ///
+    /// Cache hits are O(1) — an atomic refcount increment — making this the
+    /// preferred entry point for performance-sensitive read paths that only
+    /// need to read the state, not mutate it.
+    pub fn get_state_arc(&self, state_id: &str) -> Result<Option<Arc<Vec<u8>>>> {
+        let branch_id = self.branches.current_branch()?.id;
+        self.state.get_state_arc(branch_id, state_id)
+    }
+
     /// Get the value of a state at a specific sequence number (historical access).
     ///
     /// This reconstructs the state as it was at the given sequence by:

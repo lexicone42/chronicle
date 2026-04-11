@@ -1,7 +1,7 @@
 //! Performance benchmarks for the record store.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use record_store::{
+use chronicle::{
     RecordInput, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use serde_json::json;
@@ -191,13 +191,136 @@ fn bench_with_history(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark Arc-based state reads — tests the get_state_arc zero-copy path.
+/// Compare against bench_state_reconstruction (which uses get_state and clones).
+fn bench_state_reconstruction_arc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("state_reconstruction_arc");
+
+    for chain_depth in [10, 100, 500, 1000] {
+        group.bench_with_input(
+            BenchmarkId::new("chain_depth", chain_depth),
+            &chain_depth,
+            |b, &depth| {
+                let dir = TempDir::new().unwrap();
+                let store = create_store(&dir);
+
+                store
+                    .register_state(StateRegistration {
+                        id: "items".to_string(),
+                        strategy: StateStrategy::AppendLog {
+                            delta_snapshot_every: 10000, // No snapshots during bench
+                            full_snapshot_every: 1000,
+                        },
+                        initial_value: None,
+                    })
+                    .unwrap();
+
+                for i in 0..depth {
+                    store
+                        .update_state(
+                            "items",
+                            StateOperation::Append(format!("{}", i).into_bytes()),
+                        )
+                        .unwrap();
+                }
+
+                b.iter(|| {
+                    black_box(store.get_state_arc("items").unwrap());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark index rebuild — exercises both the log iterator and the
+/// index's batched insertion path. This is the store-open critical path.
+fn bench_index_rebuild(c: &mut Criterion) {
+    use chronicle::{RecordIndex, RecordLog};
+
+    let mut group = c.benchmark_group("index_rebuild");
+
+    for record_count in [100, 1000, 5000] {
+        group.bench_with_input(
+            BenchmarkId::new("records", record_count),
+            &record_count,
+            |b, &count| {
+                // Create a log with N records
+                let dir = TempDir::new().unwrap();
+                let log_path = dir.path().join("bench.log");
+                let idx_path = dir.path().join("bench.idx");
+                let log = RecordLog::open(&log_path).unwrap();
+                for i in 0..count {
+                    // Vary record type to exercise type_index, and add some
+                    // causation links to exercise caused_by_index
+                    let rtype = if i % 3 == 0 { "type_a" } else if i % 3 == 1 { "type_b" } else { "type_c" };
+                    let mut input = RecordInput::json(rtype, &json!({"i": i})).unwrap();
+                    if i > 0 {
+                        input = input.with_caused_by(vec![chronicle::RecordId(i as u64)]);
+                    }
+                    log.append(input, chronicle::BranchId(1), chronicle::Sequence(i as u64 + 1))
+                        .unwrap();
+                }
+
+                b.iter(|| {
+                    let index = RecordIndex::rebuild_from_log(&idx_path, &log).unwrap();
+                    black_box(index.count());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark record log iteration — exercises RecordIterator, which is used
+/// during index rebuild on store open. Critical for startup time.
+fn bench_log_iteration(c: &mut Criterion) {
+    use chronicle::RecordLog;
+
+    let mut group = c.benchmark_group("log_iteration");
+
+    for record_count in [100, 1000, 10000] {
+        group.bench_with_input(
+            BenchmarkId::new("records", record_count),
+            &record_count,
+            |b, &count| {
+                // Create a log with N records
+                let dir = TempDir::new().unwrap();
+                let log_path = dir.path().join("bench.log");
+                let log = RecordLog::open(&log_path).unwrap();
+                for i in 0..count {
+                    let input = RecordInput::json("bench", &json!({"i": i})).unwrap();
+                    log.append(input, chronicle::BranchId(1), chronicle::Sequence(i as u64 + 1))
+                        .unwrap();
+                }
+
+                b.iter(|| {
+                    let mut n = 0u64;
+                    for result in log.iter() {
+                        let (_, record) = result.unwrap();
+                        n = n.wrapping_add(record.id.0);
+                    }
+                    black_box(n);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_state_reconstruction,
+    bench_state_reconstruction_arc,
     bench_state_with_snapshots,
     bench_record_append,
     bench_blob_store,
     bench_with_history,
+    bench_log_iteration,
+    bench_index_rebuild,
 );
 
 criterion_main!(benches);
