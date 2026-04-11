@@ -52,24 +52,51 @@ impl RecordIndex {
     ///
     /// This scans the entire log sequentially and builds all indexes.
     /// For a store with 1M records, this typically takes 1-3 seconds on SSD.
+    ///
+    /// Optimized: all mutations happen inside a single lock acquisition per
+    /// sub-index, built up in local buffers during the log scan. This avoids
+    /// ~5M lock acquisitions on a 1M-record store (one per field per record).
     pub fn rebuild_from_log(path: impl AsRef<Path>, log: &RecordLog) -> Result<Self> {
         let index = Self::new(path)?;
 
-        // Iterate through all records in the log
+        // Build up all maps locally without touching the locks
+        let mut entries: BTreeMap<(BranchId, Sequence), u64> = BTreeMap::new();
+        let mut id_to_offset: HashMap<RecordId, u64> = HashMap::new();
+        let mut type_index: HashMap<String, Vec<RecordId>> = HashMap::new();
+        let mut caused_by_index: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
+        let mut linked_to_index: HashMap<RecordId, Vec<RecordId>> = HashMap::new();
+
         for result in log.iter() {
             let (offset, record) = result?;
 
-            // Add to all indexes
-            index.add(
-                record.id,
-                record.branch,
-                record.sequence,
-                offset,
-                &record.record_type,
-                &record.caused_by,
-                &record.linked_to,
-            );
+            entries.insert((record.branch, record.sequence), offset);
+            id_to_offset.insert(record.id, offset);
+
+            // Type index: only clone the record_type string once per unique type
+            // (for the first insertion). Subsequent records of the same type
+            // look up by &str without cloning.
+            match type_index.get_mut(record.record_type.as_str()) {
+                Some(vec) => vec.push(record.id),
+                None => {
+                    type_index.insert(record.record_type.clone(), vec![record.id]);
+                }
+            }
+
+            for &cause in &record.caused_by {
+                caused_by_index.entry(cause).or_default().push(record.id);
+            }
+
+            for &link in &record.linked_to {
+                linked_to_index.entry(link).or_default().push(record.id);
+            }
         }
+
+        // Swap the built maps in under single-lock acquisitions
+        *index.entries.write() = entries;
+        *index.id_to_offset.write() = id_to_offset;
+        *index.type_index.write() = type_index;
+        *index.caused_by_index.write() = caused_by_index;
+        *index.linked_to_index.write() = linked_to_index;
 
         Ok(index)
     }
@@ -95,26 +122,31 @@ impl RecordIndex {
         self.entries.write().insert((branch, sequence), offset);
         self.id_to_offset.write().insert(id, offset);
 
-        self.type_index
-            .write()
-            .entry(record_type.to_string())
-            .or_default()
-            .push(id);
-
-        for &cause in caused_by {
-            self.caused_by_index
-                .write()
-                .entry(cause)
-                .or_default()
-                .push(id);
+        // Only clone record_type string when inserting a new type — for the
+        // common case where the type already exists, look up by &str.
+        {
+            let mut type_index = self.type_index.write();
+            match type_index.get_mut(record_type) {
+                Some(vec) => vec.push(id),
+                None => {
+                    type_index.insert(record_type.to_string(), vec![id]);
+                }
+            }
         }
 
-        for &link in linked_to {
-            self.linked_to_index
-                .write()
-                .entry(link)
-                .or_default()
-                .push(id);
+        // Hold the causation index locks once per record, not once per link.
+        if !caused_by.is_empty() {
+            let mut caused_by_index = self.caused_by_index.write();
+            for &cause in caused_by {
+                caused_by_index.entry(cause).or_default().push(id);
+            }
+        }
+
+        if !linked_to.is_empty() {
+            let mut linked_to_index = self.linked_to_index.write();
+            for &link in linked_to {
+                linked_to_index.entry(link).or_default().push(id);
+            }
         }
     }
 
@@ -157,20 +189,18 @@ impl RecordIndex {
 
     /// Rebuild causation indexes for a record (used when reopening store).
     pub fn rebuild_causation_for(&self, id: RecordId, caused_by: &[RecordId], linked_to: &[RecordId]) {
-        for &cause in caused_by {
-            self.caused_by_index
-                .write()
-                .entry(cause)
-                .or_default()
-                .push(id);
+        if !caused_by.is_empty() {
+            let mut caused_by_index = self.caused_by_index.write();
+            for &cause in caused_by {
+                caused_by_index.entry(cause).or_default().push(id);
+            }
         }
 
-        for &link in linked_to {
-            self.linked_to_index
-                .write()
-                .entry(link)
-                .or_default()
-                .push(id);
+        if !linked_to.is_empty() {
+            let mut linked_to_index = self.linked_to_index.write();
+            for &link in linked_to {
+                linked_to_index.entry(link).or_default().push(id);
+            }
         }
     }
 
