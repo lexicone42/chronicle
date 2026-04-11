@@ -3,19 +3,17 @@
 //! The WAL ensures durability by writing operations to a separate log
 //! before they are committed to the main store. On recovery, uncommitted
 //! operations can be replayed.
+//!
+//! The wire format is defined in `crate::format::wal`. This file implements
+//! the reader/writer against those constants.
 
 use crate::error::{Result, StoreError};
+use crate::format::wal::{MAGIC as WAL_MAGIC, MAX_ENTRY_SIZE, VERSION as WAL_VERSION};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-
-/// Magic bytes for WAL file.
-const WAL_MAGIC: &[u8; 4] = b"WAL\0";
-
-/// Current WAL format version.
-const WAL_VERSION: u8 = 1;
 
 /// WAL entry status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,8 +291,8 @@ impl WriteAheadLog {
         reader.read_exact(&mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
-        if len > 16 * 1024 * 1024 {
-            // 16MB sanity check — prevents unbounded allocation from malformed WAL
+        if len > MAX_ENTRY_SIZE as usize {
+            // Prevents unbounded allocation from malformed WAL
             return Err(StoreError::Corruption("WAL entry too large".into()));
         }
 

@@ -8,6 +8,11 @@ directory. It's intended as a reference for:
 - Future maintainers deciding whether a change is backwards-compatible
 - Downstream consumers (like exo-self) that need to know what's stable
 
+**Single source of truth:** All constants described here are defined in
+[`src/format/mod.rs`](src/format/mod.rs). The format module is imported by
+every file that reads or writes these bytes, so there is exactly one place
+in the code where magic bytes, versions, and size limits live.
+
 ## Overview
 
 A Chronicle store is a directory containing the following files:
@@ -17,9 +22,10 @@ A Chronicle store is a directory containing the following files:
 ├── MANIFEST                 # Store identity and format version gate
 ├── LOCK                     # Exclusive access lock (not a data file)
 ├── records.log              # Append-only binary log of all records
+├── records.meta             # Persistent next_id anchor (skip O(N) scan on open)
 ├── wal.log                  # Write-ahead log for crash recovery
-├── state.bin                # Per-state chain head metadata (MessagePack)
-├── branches.bin             # Branch metadata (MessagePack)
+├── state.bin                # Per-state chain head metadata (MessagePack + CRC32)
+├── branches.bin             # Branch metadata (MessagePack + CRC32)
 └── blobs/
     └── <xx>/<full_hash>     # Content-addressed blob files (BLAKE3)
 ```
@@ -33,19 +39,26 @@ There is no `records.idx` on disk; the record index is rebuilt from
 its own magic bytes and version byte, and they move independently. The table
 below shows current values:
 
-| File | Magic | Version |
-|------|-------|---------|
-| `MANIFEST` | `RST\0` | 2 |
-| `records.log` (per-record header) | `REC\0` | 2 |
-| `state.bin` | `STI\0` | 2 |
-| `branches.bin` | `BRI\0` | 1 |
-| `wal.log` | `WAL\0` | 1 |
-| `blobs/.../<hash>` | `BLB\0` | 1 |
+| File | Magic | Current Version | Min Readable | Notes |
+|------|-------|-----------------|--------------|-------|
+| `MANIFEST` | `RST\0` | 2 | 2 | |
+| `records.log` (per-record header) | `REC\0` | 2 | 2 | v2: full-record CRC32 (v1 was payload-only) |
+| `records.meta` | `RMT\0` | 1 | 1 | Added in v2 of the store format |
+| `state.bin` | `STI\0` | 3 | 2 | v3: adds trailing CRC32 |
+| `branches.bin` | `BRI\0` | 2 | 1 | v2: adds trailing CRC32 |
+| `wal.log` | `WAL\0` | 1 | 1 | |
+| `blobs/.../<hash>` | `BLB\0` | 1 | 1 | |
 
 When we say "Chronicle v2," we mean the current collective state of these
 files — not that every file is at version 2. This distinction matters for
 migration: a version bump in `records.log` can happen without touching
 `branches.bin`, and vice versa.
+
+**Backwards-compatible reads:** `state.bin` and `branches.bin` both have
+`MIN_READABLE_VERSION < VERSION`, meaning a new Chronicle can open a store
+that was written by an older version without a CRC32. The converse is not
+true: an older Chronicle rejects files written in the newer format. Upgrade
+is one-way.
 
 ## File formats
 
@@ -114,6 +127,36 @@ If the log is truncated or corrupted mid-record, the scan stops and
 corruption are unreachable and will be overwritten by subsequent appends
 (their file space is leaked).
 
+### `records.meta`
+
+A tiny (25-byte) anchor file written next to `records.log` on every
+`RecordLog::sync()`. On open, if the anchor's `log_size` matches the
+actual `records.log` size, Chronicle skips the O(N) `find_max_id()` scan
+and uses the cached `max_id` directly.
+
+```
+Offset  Size  Field
+0       4     Magic: "RMT\0"
+4       1     Version: 0x01
+5       8     Last known max RecordId              u64 LE
+13      8     Record log file size at write time   u64 LE
+21      4     CRC32 of bytes [0..21]               u32 LE
+```
+
+Total size: 25 bytes.
+
+**Atomic writes:** `records.meta` is written via `tmp + rename` to avoid
+partial writes. If the file is missing, truncated, has the wrong magic,
+has an unrecognized version, or fails the CRC32 check, Chronicle silently
+falls back to the full scan. This makes the anchor a pure optimization:
+it can never corrupt the store, only fail to accelerate opening it.
+
+**When the anchor is stale:** If the process crashes between appends and
+`sync()` (or `sync()` is skipped), the `log_size` in `records.meta` will
+be smaller than the actual log file. Chronicle detects this mismatch and
+falls back to the scan, finding the correct `max_id` via the current
+O(N) path.
+
 ### `wal.log` (version 1)
 
 A write-ahead log used for crash recovery. Operations are written here
@@ -176,16 +219,21 @@ a commit marker on crash only causes redundant replay, not corruption.
 
 In-memory state chain metadata, serialized on `save()`.
 
+**Current version: 3.** v3 adds a trailing CRC32 over the encoded index for
+corruption detection. v2 is still readable (without the CRC32 check).
+
 ```
 Offset  Size  Field
 0       4     Magic: "STI\0"
-4       1     Version: 0x02
+4       1     Version: 0x03                        (v2 also accepted on read)
 5       8     Encoded length                       u64
 13      var   Encoded StateIndex                   MessagePack
+13+len  4     CRC32 of encoded index               u32 LE  (v3 only)
 ```
 
-**No checksum.** If `save()` is interrupted mid-write, corruption could go
-undetected until `load()` fails to deserialize.
+**v2 compatibility:** If the version byte reads 2, the CRC32 trailer is
+not present. Readers accept this form and skip verification; writers
+always produce v3.
 
 **Size limit:** 64 MiB (`PayloadTooLarge` on exceed).
 
@@ -208,19 +256,25 @@ struct StateChainHead {
 }
 ```
 
-### `branches.bin` (version 1)
+### `branches.bin`
+
+Branch metadata, serialized on `save()`.
+
+**Current version: 2.** v2 adds a trailing CRC32 over the encoded index.
+v1 is still readable (without the CRC32 check).
 
 ```
 Offset  Size  Field
 0       4     Magic: "BRI\0"
-4       1     Version: 0x01
+4       1     Version: 0x02                        (v1 also accepted on read)
 5       8     Current branch ID                    u64
 13      8     Encoded length                       u64
 21      var   Encoded BranchIndex                  MessagePack
+21+len  4     CRC32 of encoded index               u32 LE  (v2 only)
 ```
 
-**No checksum.** Same caveat as `state.bin`: partial writes are
-undetectable.
+**v1 compatibility:** If the version byte reads 1, the CRC32 trailer is
+not present. Readers accept this form; writers always produce v2.
 
 **Size limit:** 64 MiB.
 
@@ -302,37 +356,45 @@ account for them:
 
 1. **Decoupled version numbers.** As noted above, "v2" is a collective
    label. A parser that wants to read a Chronicle store must check each
-   file's magic+version independently and handle any mixture.
+   file's magic+version independently and handle any mixture. The full
+   matrix is enforced by
+   [`tests/format_matrix_test.rs`](tests/format_matrix_test.rs).
 
-2. **No checksum in `state.bin` or `branches.bin`.** A crash mid-`save()`
-   could produce a partially written file that fails deserialization but
-   is otherwise silently corrupt. This is low-risk in practice (`save()`
-   is infrequent and atomic writes are not attempted) but worth knowing.
-
-3. **`log_fence` is not independently protected.** The WAL entry CRC32
+2. **`log_fence` is not independently protected.** The WAL entry CRC32
    covers the whole entry including the fence, so typical bit-flip
    corruption is detected. But a higher-level corruption that produces a
    valid-looking entry with a wrong fence would break idempotent replay.
 
-4. **RecordId overflow is unguarded at `u64::MAX`.** On debug builds, the
+3. **RecordId overflow is unguarded at `u64::MAX`.** On debug builds, the
    next append panics. On release builds, the ID wraps to 0, potentially
    creating a duplicate. This is 584 years of continuous 1 GHz appends
    away, but it's unguarded.
 
-5. **`find_max_id` stops at corruption.** If the log is corrupted
+4. **`find_max_id` stops at corruption.** If the log is corrupted
    mid-file, everything after the corruption is effectively lost and may
    be overwritten by subsequent appends. There is no "last known good
-   offset" recovery hint persisted anywhere.
+   offset" recovery hint persisted anywhere. The `records.meta` anchor
+   mitigates the common case (clean shutdown) but does not help after
+   mid-log corruption.
 
-6. **State operations are JSON, not MessagePack.** `StateUpdateRecord` is
+5. **State operations are JSON, not MessagePack.** `StateUpdateRecord` is
    serialized via `serde_json` inside the record log's raw payload.
    That's the source of the `apply_operation` parse-reserialize O(n)
    cost. It's also the reason state chain records are partially
-   human-readable in a hex dump.
+   human-readable in a hex dump. The record header's `encoding` byte
+   allows switching to MessagePack in a future version without a format
+   break at the wrapper level.
 
-7. **Type strings and content-type strings have no explicit length
+6. **Type strings and content-type strings have no explicit length
    limit beyond u16 max** (65 KiB). Truncated UTF-8 is handled lossily
    (`String::from_utf8_lossy`) rather than erroring.
+
+### Resolved in the current format (v2)
+
+- ~~No checksum in `state.bin`~~ → state.bin v3 adds trailing CRC32
+- ~~No checksum in `branches.bin`~~ → branches.bin v2 adds trailing CRC32
+- ~~`find_max_id` is O(N) on every open~~ → `records.meta` anchor skips
+  the scan on clean shutdowns; the scan is still the fallback
 
 ## Format stability
 

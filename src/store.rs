@@ -55,12 +55,7 @@ pub struct CompactionSummary {
     pub states_needing_compaction: usize,
 }
 
-/// Magic bytes for store manifest.
-const STORE_MAGIC: &[u8; 4] = b"RST\0";
-
-/// Current store format version.
-/// v2: BLAKE3 content hashing, full-record CRC32 checksums.
-const STORE_VERSION: u8 = 2;
+use crate::format::manifest::{MAGIC as STORE_MAGIC, VERSION as STORE_VERSION};
 
 /// The main record store.
 ///

@@ -1,6 +1,10 @@
 //! Blob storage implementation.
+//!
+//! The wire format is defined in `crate::format::blob`. This file implements
+//! the reader/writer against those constants.
 
 use crate::error::{Result, StoreError};
+use crate::format::blob::{MAGIC as BLOB_MAGIC, MAX_SIZE as MAX_BLOB_SIZE, VERSION as BLOB_VERSION};
 use crate::types::{Blob, Hash};
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -8,16 +12,6 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-
-/// Magic bytes for blob files.
-const BLOB_MAGIC: &[u8; 4] = b"BLB\0";
-
-/// Current blob format version.
-const BLOB_VERSION: u8 = 1;
-
-/// Maximum blob content size: 1 GiB. Prevents unbounded allocations
-/// when reading potentially malformed blob files from disk.
-const MAX_BLOB_SIZE: u64 = 1024 * 1024 * 1024;
 
 /// Cached blob data (content + content_type).
 #[derive(Clone)]
